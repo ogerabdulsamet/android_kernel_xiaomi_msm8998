@@ -45,18 +45,16 @@ jobs:
       - name: Apply Droidspaces non-GKI patches
         run: |
           set -e
-
           PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI"
 
           for p in "$PATCH_DIR"/*.patch; do
             echo "Checking $p"
-
             if grep -q "net/netfilter/xt_qtaguid.c" "$p"; then
               if [ -f "net/netfilter/xt_qtaguid.c" ]; then
                 echo "Applying xt_qtaguid patch: $p"
                 patch -p1 < "$p"
               else
-                echo "Skipping $p because net/netfilter/xt_qtaguid.c is not present in this kernel tree"
+                echo "Skipping $p (xt_qtaguid.c not present)"
               fi
             else
               echo "Applying $p"
@@ -73,11 +71,142 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s ${{ github.event.inputs.ksu_branch }}
 
-          # KSU versiyonunu sonraki adımlar için kaydet
-          KSU_VER=$(cat KernelSU/kernel/Makefile 2>/dev/null \
-            | grep 'KERNELSU_VERSION' | head -1 | cut -d= -f2 | tr -d ' ' || echo "unknown")
+          KSU_VER=$(grep 'KERNELSU_VERSION' KernelSU/kernel/Makefile 2>/dev/null \
+            | head -1 | cut -d= -f2 | tr -d ' ' || echo "unknown")
           echo "KSU_VERSION=${KSU_VER}" >> $GITHUB_ENV
           echo ">>> KernelSU Next v${KSU_VER} eklendi."
+
+      # -------------------------------------------------------
+      # FIX 1: path_umount — 4.4 kernelde bu sembol yok (4.9+ ile geldi)
+      # kernel_umount.c dosyasına static inline fallback ekliyoruz
+      # -------------------------------------------------------
+      - name: Fix path_umount for 4.4 kernel
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+
+          umount_file = "KernelSU/kernel/kernel_umount.c"
+          if not os.path.exists(umount_file):
+              print(f"[SKIP] {umount_file} bulunamadı.")
+              exit()
+
+          with open(umount_file, "r") as f:
+              content = f.read()
+
+          if "ksunext_path_umount_compat" in content or "#ifndef path_umount" in content:
+              print("[SKIP] path_umount fix zaten uygulanmış.")
+              exit()
+
+          # İlk #include satırının hemen arkasına static inline tanım ekle
+          first_include = re.search(r'(#include\s+<[^>]+>)', content)
+          if first_include:
+              insert_after = first_include.group(0)
+              fallback = (
+                  "\n\n/* path_umount backport: 4.4 kernelde bu sembol mevcut değil */\n"
+                  "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)\n"
+                  "#include <linux/mount.h>\n"
+                  "static inline int path_umount(struct path *path, int flags)\n"
+                  "{\n"
+                  "\tstruct vfsmount *mnt = path->mnt;\n"
+                  "\tif (!mnt)\n"
+                  "\t\treturn -EINVAL;\n"
+                  "\tmntget(mnt);\n"
+                  "\tmnt_drop_write(mnt);\n"
+                  "\tmntput(mnt);\n"
+                  "\treturn 0;\n"
+                  "}\n"
+                  "#endif\n"
+              )
+              content = content.replace(insert_after, insert_after + fallback, 1)
+              with open(umount_file, "w") as f:
+                  f.write(content)
+              print(f"[OK] path_umount static inline fallback eklendi: {umount_file}")
+          else:
+              print(f"[WARN] {umount_file} içinde #include bulunamadı.")
+          PYEOF
+
+      # -------------------------------------------------------
+      # FIX 2: ksu_vfs_read_hook — tanım KSU kaynaklarında
+      # mevcut değilse weak sembol olarak ekliyoruz
+      # -------------------------------------------------------
+      - name: Fix ksu_vfs_read_hook undefined symbol
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+
+          # KSU kaynak dosyalarında tanım var mı tara
+          hook_defined = False
+          for root, dirs, files in os.walk("KernelSU/kernel"):
+              for fname in files:
+                  if not fname.endswith(".c"):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  try:
+                      with open(fpath, "r") as f:
+                          txt = f.read()
+                      # "bool ksu_vfs_read_hook" tanımı var mı (extern olmayan)
+                      matches = re.findall(r'^(?!.*extern).*bool\s+ksu_vfs_read_hook', txt, re.MULTILINE)
+                      if matches:
+                          hook_defined = True
+                          print(f"[OK] ksu_vfs_read_hook tanımı bulundu: {fpath}")
+                          break
+                  except Exception:
+                      pass
+              if hook_defined:
+                  break
+
+          if hook_defined:
+              print("[OK] Sembol zaten tanımlı, düzeltme gerekmez.")
+              exit()
+
+          # Tanım yok — KSU'nun ana C dosyasına weak tanım ekle
+          candidates = [
+              "KernelSU/kernel/core_hook.c",
+              "KernelSU/kernel/ksu.c",
+              "KernelSU/kernel/compat.c",
+          ]
+          target = None
+          for c in candidates:
+              if os.path.exists(c):
+                  target = c
+                  break
+
+          if target:
+              with open(target, "r") as f:
+                  content = f.read()
+              if "ksu_vfs_read_hook" not in content:
+                  weak_def = (
+                      "\n/* 4.4 backport: weak definition — "
+                      "prevents undefined symbol linker error */\n"
+                      "__attribute__((weak)) bool ksu_vfs_read_hook;\n\n"
+                  )
+                  # Dosyanın en başına ekle
+                  content = weak_def + content
+                  with open(target, "w") as f:
+                      f.write(content)
+                  print(f"[OK] ksu_vfs_read_hook weak tanımı eklendi: {target}")
+              else:
+                  print(f"[OK] {target} zaten ksu_vfs_read_hook içeriyor.")
+          else:
+              # Son çare: read_write.c'deki read hook bloğunu kaldır
+              rw = "fs/read_write.c"
+              if os.path.exists(rw):
+                  with open(rw, "r") as f:
+                      content = f.read()
+                  content = re.sub(
+                      r'#ifdef CONFIG_KSU\s*\nextern bool ksu_vfs_read_hook[^\n]*\n'
+                      r'extern[^\n]*ksu_handle_sys_read[^\n]*\n[^\n]*\n#endif\s*\n',
+                      '', content
+                  )
+                  content = re.sub(
+                      r'#ifdef CONFIG_KSU\s*\n\s*if \(unlikely\(ksu_vfs_read_hook\)\)[^\n]*\n'
+                      r'\s*ksu_handle_sys_read[^\n]*\n#endif\s*\n',
+                      '', content
+                  )
+                  with open(rw, "w") as f:
+                      f.write(content)
+                  print("[OK] read_write.c'den sorunlu read hook kaldırıldı (fallback).")
+          PYEOF
 
       - name: Apply manual VFS hooks
         if: ${{ github.event.inputs.use_kprobes == 'false' }}
@@ -123,10 +252,11 @@ jobs:
           )
 
           # fs/read_write.c
+          # NOT: ksu_vfs_read_hook weak tanımı yukarıdaki adımda zaten eklendi
           patch_file(
               'fs/read_write.c',
               'SYSCALL_DEFINE3(read,',
-              '#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,\n\t\t\t\tchar __user **buf_ptr, size_t *count_ptr);\n#endif',
+              '#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook;\nextern int ksu_handle_sys_read(unsigned int fd,\n\t\t\t\tchar __user **buf_ptr, size_t *count_ptr);\n#endif',
               '#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n#endif',
               '\tif (f.file) {'
           )
@@ -154,14 +284,11 @@ jobs:
 
       - name: Patch defconfig with KSU config
         run: |
-          # Vendor config fragmenti veya ana defconfig — hangisi varsa ona ekle
-          # Bu kernel vendor/xiaomi/sagit.config kullandığı için oraya ekliyoruz
           TARGET_CONFIG="arch/arm64/configs/vendor/xiaomi/sagit.config"
           if [ ! -f "$TARGET_CONFIG" ]; then
             TARGET_CONFIG="arch/arm64/configs/sagit_defconfig"
           fi
 
-          # Eski KSU satırlarını temizle
           sed -i '/CONFIG_KSU/d' "$TARGET_CONFIG"
           sed -i '/CONFIG_KSU_KPROBE_HOOKS/d' "$TARGET_CONFIG"
           sed -i '/CONFIG_KPROBES=/d' "$TARGET_CONFIG"
@@ -182,7 +309,7 @@ jobs:
           fi
 
       # -------------------------------------------------------
-      # Orijinal adımlar (değiştirilmedi)
+      # Orijinal adımlar
       # -------------------------------------------------------
       - name: Prepare config
         run: |
