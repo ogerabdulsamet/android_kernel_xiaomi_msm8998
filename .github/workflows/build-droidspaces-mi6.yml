@@ -44,7 +44,7 @@ jobs:
             fi
           done
 
-      - name: Integrate KernelSU Next (pinned older release)
+      - name: Integrate KernelSU Next (pinned)
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.0.0/kernel/setup.sh" | bash -s v3.0.0
 
@@ -101,6 +101,39 @@ jobs:
           text = text.replace(anchor, insert + "\n" + anchor, 1)
           p.write_text(text)
           print("Injected path_umount into fs/namespace.c")
+          PY
+
+      - name: Patch KSUNext for 4.4 API compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/kernelsu/allowlist.c")
+          text = p.read_text()
+
+          text = text.replace(
+              "kernel_write(fp, &magic, sizeof(magic), &off)",
+              "kernel_write(fp, (const char *)&magic, sizeof(magic), &off)"
+          )
+          text = text.replace(
+              "kernel_write(fp, &version, sizeof(version), &off)",
+              "kernel_write(fp, (const char *)&version, sizeof(version), &off)"
+          )
+          text = text.replace(
+              "kernel_write(fp, &p->profile, sizeof(p->profile), &off);",
+              "kernel_write(fp, (const char *)&p->profile, sizeof(p->profile), &off);"
+          )
+
+          if "#ifndef TWA_RESUME" not in text:
+              marker = "#include <linux/task_work.h>"
+              compat = '#include <linux/task_work.h>\\n#ifndef TWA_RESUME\\n#define TWA_RESUME 0\\n#endif'
+              if marker in text:
+                  text = text.replace(marker, compat, 1)
+              else:
+                  text = "#ifndef TWA_RESUME\\n#define TWA_RESUME 0\\n#endif\\n" + text
+
+          p.write_text(text)
+          print("Patched drivers/kernelsu/allowlist.c for legacy 4.4 API compatibility")
           PY
 
       - name: Prepare config
