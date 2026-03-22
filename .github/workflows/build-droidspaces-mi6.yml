@@ -13,7 +13,7 @@ on:
           - stable
           - dev
       use_kprobes:
-        description: 'KProbes hooks? (false = manuel VFS, önerilen 4.4 için)'
+        description: 'KProbes hooks? (false = manuel VFS, onerilen 4.4 icin)'
         required: true
         default: 'false'
         type: choice
@@ -39,260 +39,260 @@ jobs:
             gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu
 
       - name: Clone Droidspaces repo
-        run: |
-          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
+        run: git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
 
       - name: Apply Droidspaces non-GKI patches
         run: |
           set -e
           PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI"
           for p in "$PATCH_DIR"/*.patch; do
-            echo "Checking $p"
             if grep -q "net/netfilter/xt_qtaguid.c" "$p"; then
-              if [ -f "net/netfilter/xt_qtaguid.c" ]; then
-                echo "Applying xt_qtaguid patch: $p"
-                patch -p1 < "$p"
-              else
-                echo "Skipping $p (xt_qtaguid.c not present)"
-              fi
+              [ -f "net/netfilter/xt_qtaguid.c" ] && patch -p1 < "$p" || echo "Skipping $p"
             else
-              echo "Applying $p"
               patch -p1 < "$p"
             fi
           done
 
-      # -------------------------------------------------------
-      # KernelSU Next entegrasyonu
-      # -------------------------------------------------------
       - name: Integrate KernelSU Next
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s ${{ github.event.inputs.ksu_branch }}
-          KSU_VER=$(grep 'KERNELSU_VERSION' KernelSU/kernel/Makefile 2>/dev/null \
-            | head -1 | cut -d= -f2 | tr -d ' ' || echo "unknown")
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksu_branch }}
+          KSU_VER=$(grep 'KERNELSU_VERSION' KernelSU/kernel/Makefile 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ' || echo "unknown")
           echo "KSU_VERSION=${KSU_VER}" >> $GITHUB_ENV
-          echo ">>> KernelSU Next v${KSU_VER} eklendi."
 
-      # -------------------------------------------------------
-      # FIX 1: ksu_vfs_read_hook — KSU kaynaklarına weak tanım ekle
-      # Python veya regex kullanmıyoruz; doğrudan dosyanın başına yazıyoruz
-      # -------------------------------------------------------
-      - name: Fix ksu_vfs_read_hook (direct prepend)
+      # Tum patch islemleri tek Python scriptinde - YAML icinde backslash yok
+      - name: Apply all KSU fixes and VFS hooks
+        env:
+          USE_KPROBES: ${{ github.event.inputs.use_kprobes }}
         run: |
-          # KSU kaynaklarında bu sembolün tanımlı olup olmadığını kontrol et
-          DEFINED=$(grep -rl "bool ksu_vfs_read_hook" KernelSU/kernel/ \
-            | xargs grep -l "^bool ksu_vfs_read_hook\|^ *bool ksu_vfs_read_hook" 2>/dev/null | head -1)
+          python3 << 'EOF'
+          import os, sys
 
-          if [ -n "$DEFINED" ]; then
-            echo ">>> ksu_vfs_read_hook zaten tanımlı: $DEFINED"
-            exit 0
-          fi
+          def prepend_to_file(path, text):
+              """Dosyanin en basina metin ekle"""
+              if not os.path.exists(path):
+                  print(f"[MISS] {path}")
+                  return False
+              with open(path, 'r') as f:
+                  original = f.read()
+              with open(path, 'w') as f:
+                  f.write(text + "\n" + original)
+              print(f"[OK]   {path}")
+              return True
 
-          echo ">>> ksu_vfs_read_hook tanımlı değil, weak sembol ekleniyor..."
+          def insert_before(content, needle, insertion):
+              """needle'dan once insertion ekle (sadece ilk eslesme)"""
+              idx = content.find(needle)
+              if idx == -1:
+                  return content, False
+              return content[:idx] + insertion + "\n" + content[idx:], True
 
-          # core_hook.c varsa oraya, yoksa ksu.c'ye ekle
-          TARGET=""
-          for f in KernelSU/kernel/core_hook.c KernelSU/kernel/ksu.c KernelSU/kernel/compat.c; do
-            if [ -f "$f" ]; then TARGET="$f"; break; fi
-          done
+          def patch_source(path, needle_extern, extern_block, needle_call, call_block):
+              """Kaynak dosyaya extern + cagri ekle"""
+              if not os.path.exists(path):
+                  print(f"[MISS] {path}")
+                  return
+              with open(path, 'r') as f:
+                  content = f.read()
+              if 'CONFIG_KSU' in content:
+                  print(f"[SKIP] {path} already patched")
+                  return
+              content, ok1 = insert_before(content, needle_extern, extern_block)
+              content, ok2 = insert_before(content, needle_call, call_block)
+              if not ok1 or not ok2:
+                  print(f"[WARN] {path}: needle not found (extern={ok1}, call={ok2})")
+                  return
+              with open(path, 'w') as f:
+                  f.write(content)
+              print(f"[OK]   {path}")
 
-          if [ -z "$TARGET" ]; then
-            echo "::error::KSU kaynak dosyası bulunamadı!"
-            exit 1
-          fi
+          # -----------------------------------------------------------
+          # FIX 1: ksu_vfs_read_hook weak tanimi
+          # -----------------------------------------------------------
+          hook_found = False
+          for root, dirs, files in os.walk("KernelSU/kernel"):
+              for fname in files:
+                  if not fname.endswith(".c"):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  with open(fpath, 'r', errors='replace') as f:
+                      txt = f.read()
+                  lines = [l for l in txt.splitlines() if 'ksu_vfs_read_hook' in l and 'extern' not in l]
+                  if lines:
+                      hook_found = True
+                      print(f"[OK] ksu_vfs_read_hook already defined in {fpath}")
+                      break
+              if hook_found:
+                  break
 
-          # Geçici dosya oluştur: weak tanımı + orijinal içerik
-          {
-            echo "/* ksu_vfs_read_hook: weak definition for 4.4 kernel backport */"
-            echo "#include <linux/types.h>"
-            echo "__attribute__((weak)) bool ksu_vfs_read_hook;"
-            echo ""
-            cat "$TARGET"
-          } > "${TARGET}.tmp"
-          mv "${TARGET}.tmp" "$TARGET"
+          if not hook_found:
+              target = None
+              for c in ["KernelSU/kernel/core_hook.c", "KernelSU/kernel/ksu.c", "KernelSU/kernel/compat.c"]:
+                  if os.path.exists(c):
+                      target = c
+                      break
+              if target:
+                  weak_def = (
+                      "/* ksu_vfs_read_hook: weak def for 4.4 backport */\n"
+                      "#include <linux/types.h>\n"
+                      "__attribute__((weak)) bool ksu_vfs_read_hook;\n"
+                  )
+                  prepend_to_file(target, weak_def)
+              else:
+                  print("[ERROR] KSU source not found for ksu_vfs_read_hook fix")
+                  sys.exit(1)
 
-          echo ">>> Weak tanım eklendi: $TARGET"
+          # -----------------------------------------------------------
+          # FIX 2: path_umount backport (4.4 kernelde yok)
+          # -----------------------------------------------------------
+          umount_file = "KernelSU/kernel/kernel_umount.c"
+          if os.path.exists(umount_file):
+              with open(umount_file, 'r') as f:
+                  um_content = f.read()
+              if "ksunext_44_compat" not in um_content:
+                  backport = (
+                      "/* path_umount backport: added in 4.9, missing in 4.4 */\n"
+                      "#include <linux/version.h>\n"
+                      "#include <linux/mount.h>\n"
+                      "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)\n"
+                      "#define ksunext_44_compat 1\n"
+                      "static inline int path_umount(struct path *path, int flags)\n"
+                      "{\n"
+                      "\tstruct vfsmount *mnt = path->mnt;\n"
+                      "\tif (!mnt) return -EINVAL;\n"
+                      "\tmntget(mnt);\n"
+                      "\tmnt_drop_write(mnt);\n"
+                      "\tmntput(mnt);\n"
+                      "\treturn 0;\n"
+                      "}\n"
+                      "#endif\n"
+                  )
+                  prepend_to_file(umount_file, backport)
+              else:
+                  print("[SKIP] kernel_umount.c already patched")
+          else:
+              print("[MISS] kernel_umount.c not found")
 
-      # -------------------------------------------------------
-      # FIX 2: path_umount — 4.4 kernelde yok, kernel_umount.c'ye
-      # static inline implementasyon ekliyoruz
-      # -------------------------------------------------------
-      - name: Fix path_umount (direct prepend to kernel_umount.c)
-        run: |
-          UMOUNT="KernelSU/kernel/kernel_umount.c"
+          # -----------------------------------------------------------
+          # VFS hooks (use_kprobes=false ise)
+          # -----------------------------------------------------------
+          use_kprobes = os.environ.get("USE_KPROBES", "false").lower() == "true"
+          if use_kprobes:
+              print("[INFO] KPROBES mode selected, skipping manual VFS hooks")
+          else:
+              print("[INFO] Applying manual VFS hooks...")
 
-          if [ ! -f "$UMOUNT" ]; then
-            echo ">>> $UMOUNT bulunamadı, atlanıyor."
-            exit 0
-          fi
+              # fs/exec.c
+              patch_source(
+                  "fs/exec.c",
+                  "int do_execve(",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "__attribute__((hot))\n"
+                      "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+                      "\t\t\t\tvoid *argv, void *envp, int *flags);\n"
+                      "#endif"
+                  ),
+                  "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n"
+                      "#endif"
+                  )
+              )
 
-          if grep -q "ksunext_44_path_umount_compat" "$UMOUNT"; then
-            echo ">>> path_umount fix zaten uygulanmış."
-            exit 0
-          fi
+              # fs/open.c
+              patch_source(
+                  "fs/open.c",
+                  "SYSCALL_DEFINE3(faccessat,",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "__attribute__((hot))\n"
+                      "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                      "\t\t\t\tint *mode, int *flags);\n"
+                      "#endif"
+                  ),
+                  "\tif (mode & ~S_IRWXO)",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                      "#endif"
+                  )
+              )
 
-          echo ">>> path_umount backport ekleniyor..."
+              # fs/read_write.c
+              patch_source(
+                  "fs/read_write.c",
+                  "SYSCALL_DEFINE3(read,",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern bool ksu_vfs_read_hook;\n"
+                      "extern int ksu_handle_sys_read(unsigned int fd,\n"
+                      "\t\t\t\tchar __user **buf_ptr, size_t *count_ptr);\n"
+                      "#endif"
+                  ),
+                  "\tif (f.file) {",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tif (unlikely(ksu_vfs_read_hook))\n"
+                      "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+                      "#endif"
+                  )
+              )
 
-          {
-            echo "/* path_umount backport for Linux 4.4 (symbol added in 4.9) */"
-            echo "#include <linux/version.h>"
-            echo "#include <linux/mount.h>"
-            echo ""
-            echo "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)"
-            echo "#define ksunext_44_path_umount_compat 1"
-            echo "static inline int path_umount(struct path *path, int flags)"
-            echo "{"
-            echo "	struct vfsmount *mnt = path->mnt;"
-            echo "	if (!mnt)"
-            echo "		return -EINVAL;"
-            echo "	mntget(mnt);"
-            echo "	mnt_drop_write(mnt);"
-            echo "	mntput(mnt);"
-            echo "	return 0;"
-            echo "}"
-            echo "#endif"
-            echo ""
-            cat "$UMOUNT"
-          } > "${UMOUNT}.tmp"
-          mv "${UMOUNT}.tmp" "$UMOUNT"
+              # fs/stat.c
+              patch_source(
+                  "fs/stat.c",
+                  "SYSCALL_DEFINE4(newfstatat,",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "__attribute__((hot))\n"
+                      "extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
+                      "\t\t\t\tint *flags);\n"
+                      "#endif"
+                  ),
+                  "\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                      "#endif"
+                  )
+              )
 
-          echo ">>> path_umount static inline eklendi: $UMOUNT"
+              # kernel/reboot.c
+              patch_source(
+                  "kernel/reboot.c",
+                  "SYSCALL_DEFINE4(reboot,",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern int ksu_handle_sys_reboot(int magic1, int magic2,\n"
+                      "\t\t\tunsigned int cmd, void __user **arg);\n"
+                      "#endif"
+                  ),
+                  "\t/* We only trust the superuser with rebooting the system. */",
+                  (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                      "#endif"
+                  )
+              )
 
-      # -------------------------------------------------------
-      # Manuel VFS hook patch'leri
-      # -------------------------------------------------------
-      - name: Apply manual VFS hooks
-        if: ${{ github.event.inputs.use_kprobes == 'false' }}
-        run: |
-          # ---- fs/exec.c ----
-          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-            sed -i '/^int do_execve(/i\
-\
-#ifdef CONFIG_KSU\
-__attribute__((hot))\
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\
-\t\t\t\tvoid *argv, void *envp, int *flags);\
-#endif\
-' fs/exec.c
-
-            sed -i 's|\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);|\
-#ifdef CONFIG_KSU\
-\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\
-#endif\
-\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);|' fs/exec.c
-            echo ">>> exec.c patched"
-          else
-            echo ">>> exec.c already patched"
-          fi
-
-          # ---- fs/open.c ----
-          if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-            sed -i '/^SYSCALL_DEFINE3(faccessat,/i\
-\
-#ifdef CONFIG_KSU\
-__attribute__((hot))\
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\
-\t\t\t\tint *mode, int *flags);\
-#endif\
-' fs/open.c
-
-            sed -i 's|\tif (mode \& ~S_IRWXO)|\
-#ifdef CONFIG_KSU\
-\tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\
-#endif\
-\tif (mode \& ~S_IRWXO)|' fs/open.c
-            echo ">>> open.c patched"
-          else
-            echo ">>> open.c already patched"
-          fi
-
-          # ---- fs/read_write.c ----
-          if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
-            sed -i '/^SYSCALL_DEFINE3(read,/i\
-\
-#ifdef CONFIG_KSU\
-extern bool ksu_vfs_read_hook;\
-extern int ksu_handle_sys_read(unsigned int fd,\
-\t\t\t\tchar __user **buf_ptr, size_t *count_ptr);\
-#endif\
-' fs/read_write.c
-
-            sed -i 's|\tif (f.file) {|\
-#ifdef CONFIG_KSU\
-\tif (unlikely(ksu_vfs_read_hook))\
-\t\tksu_handle_sys_read(fd, \&buf, \&count);\
-#endif\
-\tif (f.file) {|' fs/read_write.c
-            echo ">>> read_write.c patched"
-          else
-            echo ">>> read_write.c already patched"
-          fi
-
-          # ---- fs/stat.c ----
-          if ! grep -q "ksu_handle_stat" fs/stat.c; then
-            sed -i '/^SYSCALL_DEFINE4(newfstatat,/i\
-\
-#ifdef CONFIG_KSU\
-__attribute__((hot))\
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\
-\t\t\t\tint *flags);\
-#endif\
-' fs/stat.c
-
-            sed -i 's|\terror = vfs_fstatat(dfd, filename, \&stat, flag);|\
-#ifdef CONFIG_KSU\
-\tksu_handle_stat(\&dfd, \&filename, \&flag);\
-#endif\
-\terror = vfs_fstatat(dfd, filename, \&stat, flag);|' fs/stat.c
-            echo ">>> stat.c patched"
-          else
-            echo ">>> stat.c already patched"
-          fi
-
-          # ---- kernel/reboot.c ----
-          if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-            sed -i '/^SYSCALL_DEFINE4(reboot,/i\
-\
-#ifdef CONFIG_KSU\
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\
-#endif\
-' kernel/reboot.c
-
-            sed -i 's|\t/\* We only trust the superuser with rebooting the system\. \*/|\
-#ifdef CONFIG_KSU\
-\tksu_handle_sys_reboot(magic1, magic2, cmd, \&arg);\
-#endif\
-\t/* We only trust the superuser with rebooting the system. */|' kernel/reboot.c
-            echo ">>> reboot.c patched"
-          else
-            echo ">>> reboot.c already patched"
-          fi
+          print("\nAll fixes applied successfully.")
+          EOF
 
       - name: Patch defconfig with KSU config
         run: |
-          TARGET_CONFIG="arch/arm64/configs/vendor/xiaomi/sagit.config"
-          [ ! -f "$TARGET_CONFIG" ] && TARGET_CONFIG="arch/arm64/configs/sagit_defconfig"
-
-          sed -i '/CONFIG_KSU/d' "$TARGET_CONFIG"
-          sed -i '/CONFIG_KSU_KPROBE_HOOKS/d' "$TARGET_CONFIG"
-          sed -i '/CONFIG_KPROBES=/d' "$TARGET_CONFIG"
-          sed -i '/CONFIG_KPROBE_EVENTS=/d' "$TARGET_CONFIG"
-
-          {
-            echo ""
-            echo "# KernelSU Next"
-            echo "CONFIG_KSU=y"
-          } >> "$TARGET_CONFIG"
-
+          TARGET="arch/arm64/configs/vendor/xiaomi/sagit.config"
+          [ ! -f "$TARGET" ] && TARGET="arch/arm64/configs/sagit_defconfig"
+          sed -i '/CONFIG_KSU/d;/CONFIG_KSU_KPROBE_HOOKS/d;/CONFIG_KPROBES=/d;/CONFIG_KPROBE_EVENTS=/d' "$TARGET"
+          echo "" >> "$TARGET"
+          echo "CONFIG_KSU=y" >> "$TARGET"
           if [ "${{ github.event.inputs.use_kprobes }}" = "true" ]; then
-            printf "CONFIG_KSU_KPROBE_HOOKS=y\nCONFIG_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\n" >> "$TARGET_CONFIG"
+            printf "CONFIG_KSU_KPROBE_HOOKS=y\nCONFIG_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\n" >> "$TARGET"
           else
-            echo "CONFIG_KSU_KPROBE_HOOKS=n" >> "$TARGET_CONFIG"
+            echo "CONFIG_KSU_KPROBE_HOOKS=n" >> "$TARGET"
           fi
+          echo "Config updated: $TARGET"
 
-      # -------------------------------------------------------
-      # Orijinal adımlar
-      # -------------------------------------------------------
       - name: Prepare config
         run: |
           mkdir -p out
@@ -309,30 +309,24 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void 
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz-dtb dtbs 2>&1 | tee build.log
-
           if [ ! -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-            echo "::error::Image.gz-dtb bulunamadı! Derleme başarısız."
+            echo "::error::Image.gz-dtb not found"
             exit 1
           fi
 
       - name: Clone AnyKernel3
-        run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+        run: git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
       - name: Prepare flashable zip
         run: |
           cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           cd AnyKernel3
-
-          sed -i 's|kernel.string=.*|kernel.string=Mi6 Droidspaces + KSUNext v${{ env.KSU_VERSION }} by Abdulsamet|' anykernel.sh
-          sed -i 's|do.devicecheck=.*|do.devicecheck=1|' anykernel.sh
-          sed -i 's|device.name1=.*|device.name1=sagit|' anykernel.sh
-          sed -i '/device.name2=/d' anykernel.sh
-          sed -i '/device.name3=/d' anykernel.sh
-          sed -i '/device.name4=/d' anykernel.sh
-          sed -i 's|BLOCK=.*|BLOCK=boot;|' anykernel.sh
-          sed -i 's|IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=0;|' anykernel.sh
-
+          sed -i "s|kernel.string=.*|kernel.string=Mi6 Droidspaces + KSUNext v${{ env.KSU_VERSION }} by Abdulsamet|" anykernel.sh
+          sed -i "s|do.devicecheck=.*|do.devicecheck=1|" anykernel.sh
+          sed -i "s|device.name1=.*|device.name1=sagit|" anykernel.sh
+          sed -i "/device.name2=/d;/device.name3=/d;/device.name4=/d" anykernel.sh
+          sed -i "s|BLOCK=.*|BLOCK=boot;|" anykernel.sh
+          sed -i "s|IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=0;|" anykernel.sh
           ZIP_NAME="Mi6-Droidspaces-KSUNext-v${{ env.KSU_VERSION }}-$(date +%Y%m%d).zip"
           zip -r9 "../${ZIP_NAME}" . -x ".git*" "README.md" "*placeholder"
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
