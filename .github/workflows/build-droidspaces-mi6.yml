@@ -1,4 +1,4 @@
-name: Build Mi6 Kernel with Droidspaces
+name: Build Mi6 Kernel with Droidspaces ZIP
 
 on:
   workflow_dispatch:
@@ -47,11 +47,30 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz-dtb dtbs
 
-      - name: Upload kernel artifacts
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+      - name: Prepare flashable zip
+        run: |
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          cd AnyKernel3
+
+          sed -i 's|kernel.string=.*|kernel.string=Mi6 Droidspaces Kernel by Abdulsamet|' anykernel.sh
+          sed -i 's|do.devicecheck=.*|do.devicecheck=1|' anykernel.sh
+          sed -i 's|device.name1=.*|device.name1=sagit|' anykernel.sh
+          sed -i '/device.name2=/d' anykernel.sh
+          sed -i '/device.name3=/d' anykernel.sh
+          sed -i '/device.name4=/d' anykernel.sh
+          sed -i 's|BLOCK=.*|BLOCK=boot;|' anykernel.sh
+          sed -i 's|IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=0;|' anykernel.sh
+
+          zip -r9 ../Mi6-Droidspaces-Kernel.zip . -x ".git*" "README.md" "*placeholder"
+
+      - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: mi6-droidspaces-kernel
+          name: Mi6-Droidspaces-Kernel-ZIP
           path: |
-            out/arch/arm64/boot/Image.gz-dtb
-            out/arch/arm64/boot/dts/**/*.dtb
+            Mi6-Droidspaces-Kernel.zip
             out/.config
