@@ -27,12 +27,10 @@ jobs:
       - name: Apply Droidspaces non-GKI patches
         run: |
           set -e
-
           PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI"
 
           for p in "$PATCH_DIR"/*.patch; do
             echo "Checking $p"
-
             if grep -q "net/netfilter/xt_qtaguid.c" "$p"; then
               if [ -f "net/netfilter/xt_qtaguid.c" ]; then
                 echo "Applying xt_qtaguid patch: $p"
@@ -46,14 +44,79 @@ jobs:
             fi
           done
 
-      - name: Integrate KernelSU Next (legacy)
+      - name: Integrate KernelSU Next (pinned older release)
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.0.0/kernel/setup.sh" | bash -s v3.0.0
+
+      - name: Backport path_umount for pre-5.9 kernels
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("fs/namespace.c")
+          text = p.read_text()
+
+          if "int path_umount(struct path *path, int flags)" in text:
+              print("path_umount already present, skipping")
+              raise SystemExit(0)
+
+          anchor = "/*\n * Now umount can handle mount points as well as block devices.\n"
+          insert = r'''
+          static int can_umount(const struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+
+          	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+          		return -EINVAL;
+          	if (!may_mount())
+          		return -EPERM;
+          	if (path->dentry != path->mnt->mnt_root)
+          		return -EINVAL;
+          	if (!check_mnt(mnt))
+          		return -EINVAL;
+          	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+          		return -EINVAL;
+          	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          		return -EPERM;
+          	return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+          	int ret;
+
+          	ret = can_umount(path, flags);
+          	if (!ret)
+          		ret = do_umount(mnt, flags);
+
+          	dput(path->dentry);
+          	mntput_no_expire(mnt);
+          	return ret;
+          }
+
+          '''
+          if anchor not in text:
+              raise SystemExit("Anchor not found in fs/namespace.c; patch manually needed")
+          text = text.replace(anchor, insert + "\n" + anchor, 1)
+          p.write_text(text)
+          print("Injected path_umount into fs/namespace.c")
+          PY
 
       - name: Prepare config
         run: |
           mkdir -p out
           make O=out ARCH=arm64 vendor/xiaomi/mi8998_defconfig vendor/xiaomi/sagit.config droidspaces.config
+
+      - name: Enable KSU + KPROBES if missing
+        run: |
+          {
+            grep -q '^CONFIG_KSU=' out/.config || echo 'CONFIG_KSU=y'
+            grep -q '^CONFIG_KPROBES=' out/.config || echo 'CONFIG_KPROBES=y'
+            grep -q '^CONFIG_HAVE_KPROBES=' out/.config || echo 'CONFIG_HAVE_KPROBES=y'
+            grep -q '^CONFIG_KPROBE_EVENTS=' out/.config || echo 'CONFIG_KPROBE_EVENTS=y'
+          } >> out/.config
+          make O=out ARCH=arm64 olddefconfig
 
       - name: Build kernel
         run: |
