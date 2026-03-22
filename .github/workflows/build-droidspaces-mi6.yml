@@ -26,9 +26,23 @@ jobs:
       - name: Apply Droidspaces non-GKI patches
         run: |
           set -e
-          for p in /tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI/*.patch; do
-            echo "Applying $p"
-            patch -p1 < "$p"
+
+          PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI"
+
+          for p in "$PATCH_DIR"/*.patch; do
+            echo "Checking $p"
+
+            if grep -q "net/netfilter/xt_qtaguid.c" "$p"; then
+              if [ -f "net/netfilter/xt_qtaguid.c" ]; then
+                echo "Applying xt_qtaguid patch: $p"
+                patch -p1 < "$p"
+              else
+                echo "Skipping $p because net/netfilter/xt_qtaguid.c is not present in this kernel tree"
+              fi
+            else
+              echo "Applying $p"
+              patch -p1 < "$p"
+            fi
           done
 
       - name: Prepare config
