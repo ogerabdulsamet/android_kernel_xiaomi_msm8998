@@ -1,0 +1,57 @@
+name: Build Mi6 Kernel with Droidspaces
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison build-essential ccache curl flex git kmod \
+            libelf-dev libssl-dev lld llvm clang lz4 pahole \
+            python3 rsync unzip zip zstd
+
+      - name: Clone Droidspaces repo
+        run: |
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
+
+      - name: Apply Droidspaces non-GKI patches
+        run: |
+          set -e
+          for p in /tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/non-GKI/*.patch; do
+            echo "Applying $p"
+            patch -p1 < "$p"
+          done
+
+      - name: Prepare config
+        run: |
+          mkdir -p out
+          make O=out ARCH=arm64 vendor/xiaomi/mi8998_defconfig vendor/xiaomi/sagit.config droidspaces.config
+
+      - name: Build kernel
+        run: |
+          make -j"$(nproc)" O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            Image.gz-dtb dtbs
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi6-droidspaces-kernel
+          path: |
+            out/arch/arm64/boot/Image.gz-dtb
+            out/arch/arm64/boot/dts/**/*.dtb
+            out/.config
