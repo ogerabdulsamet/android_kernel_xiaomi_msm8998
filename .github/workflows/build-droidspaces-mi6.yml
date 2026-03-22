@@ -17,7 +17,8 @@ jobs:
           sudo apt install -y \
             bc bison build-essential ccache curl flex git kmod \
             libelf-dev libssl-dev lld llvm clang lz4 pahole \
-            python3 rsync unzip zip zstd
+            python3 rsync unzip zip zstd \
+            gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu
 
       - name: Clone Droidspaces repo
         run: |
@@ -58,6 +59,7 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz-dtb dtbs
 
